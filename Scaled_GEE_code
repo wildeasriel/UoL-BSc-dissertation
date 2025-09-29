@@ -1,0 +1,547 @@
+///////////////////////////
+/// ADDING INITIAL DATA ///
+///////////////////////////
+
+    // Import RGI polygons for Vatnajokull
+
+var rgiVatna = ee.FeatureCollection('projects/ee-jmleaglacio/assets/RGI7pt0/RGI7product')                                 // Import RGI collection and filter to polygons within a Vatnajokull polygon
+  .filter(ee.Filter.bounds(geometry))
+  
+Map.addLayer(rgiVatna.geometry(), null, 'RGI Vatnajokull polygons')                           
+print ('RGI Vatnajokull polygons:', rgiVatna)
+
+
+    // Import DEM for Vatnajokull
+    
+var demVatna = ee.Image("MERIT/DEM/v1_0_3").select('dem').clip(rgiVatna)                                                  // Import MERIT DEM and clip to extent of RGI Vatnajokull polygons
+
+Map.addLayer(ee.Terrain.hillshade(demVatna), null, 'Merit DEM')                                                           // Add as map layer using a simple hillshade
+
+
+    // Import centrelines for Vatnajokull
+    
+var centrelinesVatna = ee.FeatureCollection('projects/ee-jmleaglacio/assets/RGI7pt0/RGI7centerlines')                     // Import RGI centrelines product, filtering to centrelines within a Vatnajokull polygon
+  .filter(ee.Filter.bounds(geometry))
+  .sort('length_m', false)                                                                                                // Sort centrelines in descending order
+    
+//Map.addLayer(centrelinesVatna, null, 'RGI Vatnajokull centrelines:')
+
+
+
+
+
+
+
+
+
+/////////////////////////////
+///     CLOUD MASKING     ///
+/////////////////////////////
+
+/// > from Robert McNabb, via Davies et al. (2024)
+/// > Defines a function which works as a bitmask filter using the QA_pixel quality band to filter out pixels affected by clouds and cloud shadows
+
+function cloudMask(image) {
+  var qa = image.select('QA_PIXEL');
+  var cloud = qa
+    .bitwiseAnd(1 << 1)                                                                                                 // dilated clouds
+    .or(qa.bitwiseAnd(1 << 2))                                                                                          // cirrus
+    .or(qa.bitwiseAnd(1 << 3))                                                                                          // cloud
+    .or(qa.bitwiseAnd(1 << 4));                                                                                         // cloud shadow
+
+  return image.updateMask(cloud.not())                                                                                  //.updateMask(edge);
+}
+
+
+
+
+
+
+
+
+
+
+///////////////////////////////////
+/// COMBINED LANDSAT COLLECTION ///
+///////////////////////////////////
+
+/// > Loads Landsat 4-9
+/// > Filters to the bounds of the shapefile
+/// > Remaps relevant bands from Landsats 4-7 to those from Landsats 8-9
+/// > Masks cloudy pixels
+/// > Does NOT filter out whole cloudy images due to persistently high cloud cover above Vatnajökull
+
+var landsat4 = ee.ImageCollection("LANDSAT/LT04/C02/T1_L2").filterBounds(rgiVatna)                                      // .filterBounds ensures only loading images within rgi shapefile
+  .select(['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7', 'QA_PIXEL'],                                           // Select bands and reassign to those used in Landsat 8-9
+    ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7', 'QA_PIXEL'])
+  .map(cloudMask)                                                                                                       // Map McNabb's cloud mask function over the collection
+
+var landsat5 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2").filterBounds(rgiVatna)
+  .select(['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7', 'QA_PIXEL'],
+    ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7', 'QA_PIXEL'])
+  .map(cloudMask)
+
+var landsat7 = ee.ImageCollection("LANDSAT/LE07/C02/T1_L2").filterBounds(rgiVatna)                                      // Note shift from TM to ETM
+  .select(['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7', 'QA_PIXEL'],
+    ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7', 'QA_PIXEL'])
+  .map(cloudMask)
+
+var landsat8 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2").filterBounds(rgiVatna)                                      // Note shift from ETM to OLI
+  .select(['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7', 'QA_PIXEL'])
+  .map(cloudMask)
+  
+var landsat9 = ee.ImageCollection("LANDSAT/LC09/C02/T1_L2").filterBounds(rgiVatna)
+  .select(['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7', 'QA_PIXEL'])
+  .map(cloudMask)
+
+var landsat = landsat4
+  .merge(landsat5)
+  .merge(landsat7)
+  .merge(landsat8)
+  .merge(landsat9)
+  .sort('system:time_start');
+
+
+
+
+
+
+
+
+
+
+
+///////////////////////////
+///         NDSI        ///
+///////////////////////////
+
+var landsatNdsiUnmappedNoMask = function(image) {                                                                       // Creates a function which...
+  var ndsi = image.expression(                                                                                          // For each image in a given collection applies the expression...
+    '(green - swir1) / (green + swir1)',                                                                                // Of the NDSI equation...
+    {
+      green: image.select('SR_B3'),                                                                                     // For which these are the bands required...
+      swir1: image.select('SR_B6')
+    });
+    
+  return image.addBands(ndsi.rename('NDSI'));                                                                           // And this adds NDSI as a band to the image in the collection.
+};
+
+var landsatNdsiNoMask = landsat.map(landsatNdsiUnmappedNoMask)
+
+var landsatNdsi = landsatNdsiNoMask.map(function(image) {
+  var ndsi = image.select('NDSI');
+  var ndsiMask = ndsi.gt(0.38);
+  
+  return image.updateMask(ndsiMask).clip(rgiVatna)
+});
+
+
+
+
+
+
+
+
+
+
+///////////////////////////
+///        ALBEDO       ///
+///////////////////////////
+
+/// > Calculates albedo using an eq. presented by Liang (2001), via Davies et al. (2024)
+/// > Adapted to use USGS scale factors
+
+var scaleFactor = 0.0000275;
+var offset = -0.2;
+
+var landsatAlbedoUnmapped = function(image){                                                                            // Creates a function which...
+  
+  var scaledBands = image.select(['SR_B2', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7'])                                         // Rescales the bands in each image in a given collection so albedo can be calculated accurately...
+    .multiply(scaleFactor).add(offset);
+  
+  var albedo = scaledBands.expression(
+    '(0.356 * blue) + (0.130 * red) + (0.373 * nir) + (0.085 * swir1) + (0.072 * swir2) - 0.0018',                      // Calculates Liang's shortwave albedo equation for each image using the rescaled bands...
+    {
+      'blue': scaledBands.select('SR_B2'),                                                                              // Defines these as the bands...
+      'red': scaledBands.select('SR_B4'),
+      'nir': scaledBands.select('SR_B5'),
+      'swir1': scaledBands.select('SR_B6'),
+      'swir2': scaledBands.select('SR_B7')
+    })
+    .clamp(0,1);                                                                                                        // Restricts values to between 0 and 1...        
+  
+  return image.addBands(albedo.rename('Albedo'));                                                                       // Adds albedo as an image band.
+};
+
+var landsatAlbedoNdsi = landsatNdsi.map(landsatAlbedoUnmapped);
+
+
+
+
+
+
+
+
+
+///////////////////////////
+///     MEAN ALBEDO     ///
+///////////////////////////
+
+var addMeanAlbedoMetadata = function(image) {
+  var meanAlbedoDict = image.select('Albedo').reduceRegion({                                                            //
+    reducer: ee.Reducer.mean(),
+    geometry: rgiVatna,
+    scale: 30,
+    maxPixels: 1e13
+  });
+  
+  var meanAlbedo = ee.Number(meanAlbedoDict.get('Albedo'));
+  return image.set('MEAN_ALBEDO', meanAlbedo);
+}
+
+var landsatComplete = landsatAlbedoNdsi.map(addMeanAlbedoMetadata)
+
+
+
+
+
+
+
+
+
+///////////////////////////////////////////////////////////////////////////////////////                                 //
+///                            GLACIER ALBEDO LOOP                                  ///
+///////////////////////////////////////////////////////////////////////////////////////
+
+//////////////////////////
+/// LOOP OVER GLACIERS ///
+//////////////////////////
+
+/// > Produces a list of glaciers on the basis of RGI ID and puts them into a loop
+/// > Adapted from James Lea, via Outlook
+
+var glacierList = rgiVatna.aggregate_array('rgi_id')                                                                    // Collects RGI IDs from Vatnajokull glaciers and compiles them into a server side list
+
+ee.List(glacierList).evaluate(function(clientSideList) {                                                                // Takes the list and converts into a client side list for standard JavaScript operation
+  
+  for (var i = 0; i < clientSideList.length; i++) {                                                                     // Creates a variable i = 0, and loops through until i = length of list - 1. Increases i by 1 after each run
+    
+    var glacierId = clientSideList[i];                                                                                  // For each iteration, glacierId = i, causing the code to loop through each glacier in Vatnajokull
+    print('Processing glacier:', glacierId);
+    
+    var glacier = ee.FeatureCollection(rgiVatna)                                                                        // Takes the whole Vatnajokull collection and finds the glacier polygon which matches the RGI ID, extracting it as a single feature
+      .filter(ee.Filter.eq('rgi_id', glacierId))
+      .first();
+      
+    var glacierGeom = glacier.geometry()                                                                                // Extracts the geometry of the glacier
+    
+
+
+
+
+
+
+
+
+
+//////////////////////////////
+/// MONTHLY ALBEDO MOSAICS ///
+//////////////////////////////
+
+/// > Uses a rolling 30 day window method to produce albedo mosaics from 1984-2024 from valid images
+/// > Further extracts a list of non-empty mosaics (ie., mosaics from months with >0 images)
+/// > (Optionally) exports this data as a .csv file to Drive
+/// > Adapted from Amirhossein Ahrari: https://www.youtube.com/watch?v=ygAu-fEFWjY (and associated Google Earth Engine code)
+
+    var startYear = 1984;                                                                                               // Set start and end years for rolling mosaics...
+    var endYear = 2024;
+
+    var years = ee.List.sequence(startYear, endYear);                                                                   // Create a list of years from 1984 to 2024
+    var months = ee.List.sequence(1, 12);                                                                               // Create a list of numbers from 1 to 12 and call these months
+
+    var monthlyMosaicsWithEmptyMosaics = ee.ImageCollection.fromImages(                                                 // Creates an image collection...
+      years.map(function(y) {                                                                                           // Which for year 'y' in years 1984-2024...
+        return months.map(function(m) {                                                                                 // returns months 1-12, and as a function of months 'm'...                                                 
+          
+          var start = ee.Date.fromYMD(y, m, 1)                                                                          // defines each month window, e.g. if y = 1998 and m = 01, start = 1998-01-01, then...
+          var end = start.advance(1, 'month');                                                                          // defines the end of a month as being yyyy-mm+1-01 (e.g. 1998-02-01).
+          
+          var mosaic = landsatComplete                                                                                  // Produces a mosaic using the full Landsat albedo collection...
+            .filterDate(start, end)                                                                                     // using images filtered to a given month in a given year...
+            .sort('MEAN_ALBEDO', true)                                                                                  // and sorted to ensure the images with the lowest mean albedo are prioritised...
+            .select(['Albedo', 'SR_B4'])                                                                                // select and extract the albedo and red (SR_B4) bands...
+            .mosaic()                                                                                                   // produce a mosaic from this information...
+            .clip(glacierGeom);                                                                                         // and clip to the glacier geometry.
+            
+          return mosaic.set({                                                                                           // Return the mosaic and set
+            'YEAR': y,                                                                                                  // the year,
+            'MONTH': m,                                                                                                 // month,
+            'DATE_START': start.format('YYYY-MM-dd'),                                                                   // first day of that month
+            'system:time_start': start.millis()                                                                         // and system time start as metadata.
+          });
+        });
+      }).flatten()
+    );
+    
+    var mosaicsBandCount = monthlyMosaicsWithEmptyMosaics.map(function(img) {                                           // Count the number of bands available in each mosaic (empty mosaics should have 0 bands)
+      return img.set('band_count', img.bandNames().size());
+    });
+    
+    var mosaics = mosaicsBandCount.filter(ee.Filter.gt('band_count', 0));                                               // And create the final set of mosaics by filtering out empty mosaics.
+
+
+
+
+
+
+
+
+
+
+/////////////////////////////////
+/// VALID AREA AND PERCENTAGE ///
+/////////////////////////////////
+
+/// > Calculate valid percentage area
+/// > Adapted from James Lea
+
+    var glacierArea = ee.Number(ee.Feature(glacier).area(0.1).divide(1e6))                                              // Extracts the area of the glacier in m^2 and divides by 1e6 to convert from m^2 to km^2
+    
+    var landsatValidPixels = function(image) {                                                                          // Creates a valid pixel mask function which, for images in a given collection...
+      var landsatImageBinary = ee.Image(image).select(['SR_B4']).gte(0);                                                // creates a binary mask over an image by selecting only pixels where an arbitrary band (in this case, red) has valid values (>0)...
+      var landsatImagePixelArea = ee.Image(landsatImageBinary).multiply(ee.Image.pixelArea());                          // then finds the area in m^2 of the valid pixels.
+      
+      var landsatArea = ee.Number(                                                                                      // Creates a dictionary of key/value pixels where...
+        ee.Dictionary(
+          ee.Image(landsatImagePixelArea).reduceRegion({  
+            reducer: ee.Reducer.sum(),                                                                                  // the total pixel area is taken and reduced to...
+            scale: 30,
+            maxPixels: 1e13,
+            geometry: glacierGeom                                                                                       // the sum of the pixel area.
+          })
+        ).get('SR_B4')
+      );
+      
+      var landsatAreaKm2 =  landsatArea.divide(1e6);                                                                    // Converts from m^2 to km^2 to stay consistent with polygon area and avoid division errors
+      var landsatCoverPct = ee.Number(landsatAreaKm2).divide(glacierArea).multiply(100);                                // and also finds valid pixel coverage as a percentage of the glacier area
+      
+      return image.set({                                                                                                // Adds valid pixel area and percentage as image metadata.
+        'VALID_PIXEL_AREA': landsatAreaKm2,
+        'VALID_PIXEL_PERCENTAGE': landsatCoverPct
+      });
+    };
+    
+    var mosaicsValidArea = mosaics                                                                                      // Maps landsatValidPixels over the mosaic collection
+      .map(landsatValidPixels)
+      .filter(ee.Filter.gte('VALID_PIXEL_PERCENTAGE', 80))                                                              // and filter out images with <80% valid pixel coverage.
+
+
+
+
+
+
+
+
+
+/////////////////////
+/// MEAN METADATA ///
+/////////////////////
+
+/// > Creates functions which reduces albedo to mean values for each image
+/// > Adds this as image property metadata
+/// > Structure adapted from JL's code for valid area above and from
+///   https://developers.google.com/earth-engine/apidocs/ee-image-reduceregion
+
+    var addMeanAlbedoMetadata = function(image) {                                                                       // Creates a function which...
+      var meanAlbedoDict = image.select('Albedo').reduceRegion({                                                        // for an image in a given collection selects the albedo band and reduces to...
+        reducer: ee.Reducer.mean(),                                                                                     // the mean value...
+        geometry: glacierGeom,                                                                                          // for the glacier geometry...
+        scale: 30,                                                                                                      // at this scale...
+        maxPixels: 1e13                                                                                                 // and utilising the absolute maximum of pixels GEE will allow.
+      });
+      
+      var meanAlbedo = ee.Number(meanAlbedoDict.get('Albedo'));                                                         // Extracts the mean albedo value from the meanAlbedoDict image collection...
+      
+      return image.set('MEAN_ALBEDO', meanAlbedo)                                                                       // and sets this as an image property.
+    };
+    
+    var mosaicValidAreaMeanAlbedo = mosaicsValidArea.map(addMeanAlbedoMetadata);                                        // Creates a new image collection using the mosaic collection
+    
+    
+
+
+
+
+
+
+
+
+
+/////////////////////////////////////////////
+/// ACCUMULATION AND ABLATION ZONE ALBEDO ///
+/////////////////////////////////////////////
+
+/// > Adds MERIT DEM and finds 58th percentile (general albation/accumulation area elevation boundary from Oien et al. (2021)
+/// > Masks areas <58th percentile to find accumulation area albedo
+/// > Masks areas >58th percentile to find ablation area albedo
+
+    var aar58 = ee.Number(                                                                                              // Finds the 58th elevation percentile
+      demVatna.reduceRegion({                                                                                           // by reducing the DEM
+        reducer: ee.Reducer.percentile([58]),                                                                           // using the ee.Reducer.percentile function
+        geometry: glacierGeom,
+        scale: 30,
+        maxPixels: 1e13
+      }).get('dem')
+    );
+    
+    var ablationMask = demVatna.lt(aar58);                                                                              // Produces a mask for the ablation zone by masking the accumulation zone
+    var accumulationMask = demVatna.gte(aar58);                                                                         // Produces a mask for the accumulation zone by masking the ablation zone
+    
+    var zonalAlbedoMosaicsUnmapped = function(image) {                                                                  // Calculates separate albedo values for the accumulation and albedo zones...
+      var ablationAlbedo = image.select('Albedo').updateMask(ablationMask).reduceRegion({                               // by taking an image, masking the accumulation or ablation zone...
+        reducer: ee.Reducer.mean(),                                                                                     // and calculating mean albedo for the relevant zone.
+        geometry: glacierGeom,
+        scale: 30,
+        maxPixels: 1e13
+      });
+      
+      var ablation = ee.Number(ablationAlbedo.get('Albedo'));
+      
+      var accumulationAlbedo = image.select('Albedo').updateMask(accumulationMask).reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: glacierGeom,
+        scale: 30,
+        maxPixels: 1e13
+      });
+      
+      var accumulation = ee.Number(accumulationAlbedo.get('Albedo'));
+      
+      return image.set({                                                                                                // Sets ablation and accumulation zone albedo metadata
+        'MEAN_ALBEDO_ABLATION': ablation,
+        'MEAN_ALBEDO_ACCUMULATION': accumulation
+      });
+    };
+
+    var zonalAlbedoMosaics = mosaicValidAreaMeanAlbedo.map(zonalAlbedoMosaicsUnmapped);                                 // Maps this function over the whole mosaic collection, thereby adding ablation and accumulation zone albedo metadata
+
+
+
+
+
+
+
+
+
+//////////////////////////////////
+/// PREPARE MOSAIC DATA EXPORT ///
+//////////////////////////////////
+
+    var mosaicStats = zonalAlbedoMosaics.map(function(img) {                                                            // Prepares the mosaic collection for export to Drive by setting all relevant metadata for each mosaic
+      return ee.Feature(null, {
+        'RGI_ID': glacierId,
+        'YEAR': img.get('YEAR'),
+        'MONTH': img.get('MONTH'),
+        'DATE_START': img.get('DATE_START'),
+        'VALID_PIXEL_AREA': img.get('VALID_PIXEL_AREA'),
+        'VALID_PIXEL_PERCENTAGE': img.get('VALID_PIXEL_PERCENTAGE'),
+        'MEAN_ALBEDO': img.get('MEAN_ALBEDO'),
+        'MEAN_ALBEDO_ACCUMULATION': img.get('MEAN_ALBEDO_ACCUMULATION'),
+        'MEAN_ALBEDO_ABLATION': img.get('MEAN_ALBEDO_ABLATION')
+      })
+    });
+
+
+
+
+
+
+
+
+
+
+
+///////////////////////////////////
+/// CENTRELINE ALBEDO TRANSECTS ///
+///////////////////////////////////
+
+/// > Extract main glacier centreline and split into segments of 500m
+/// > Reduce albedo under the centreline to produce a transect
+/// > Adapted from James Lea: https://code.earthengine.google.com/3683f4606ed26586d7c697d6562cb0d2
+
+    var centreline = centrelinesVatna.filter(ee.Filter.eq('rgi_g_id', glacierId)).first()                               // Extracts the glacier's longest centreline
+    
+    var centrelineLength = ee.Number(ee.Feature(centreline).get('length_m'));                                           // Extracts the length of the centreline
+    
+    var centrelineSplitDistances = ee.List.sequence(0,centrelineLength,500)                                             // Produces a sequence of numbers increasing by 500, starting from 0 and ending at the glacier's length
+    
+    var centrelineCoordsList = ee.List(ee.Feature(centreline)                                                           // Splits the centreline into segments by the units in the above variable, and extract the geometry and coordinates
+      .cutLines(centrelineSplitDistances).geometry().coordinates());
+      
+    var centrelineCoordsListIndex = ee.List.sequence(0,                                                                 // Produces a list of indices corresponding to each segment of the centreline...
+    ee.Number(ee.List(centrelineCoordsList).size()).subtract(1));
+    
+    var splitLines = ee.FeatureCollection(ee.List(centrelineCoordsListIndex)                                            // Maps over the list of indices
+      .map(function(ind){
+        var line = ee.Geometry.LineString(ee.List(centrelineCoordsList).get(ind))                                       // Creates a distinct line geometry for a given pair of segment coordinates
+        return ee.Feature(line)                                                                                         // Forms the line into an ee.Feature so attributes can be attached, including...
+          .set('RGI_ID', glacierId,                                                                                     // the RGI ID...
+               'DISTANCE_MIN', centrelineSplitDistances.get(ind),                                                       // the highest position of the segment (e.g. if ind=5, distance=2500)
+               'DISTANCE_MAX', centrelineSplitDistances.get(ee.Number(ind).add(1)),                                     // the lowest position of the segment...
+               'DISTANCE_MID', ee.Number(ee.Number(centrelineSplitDistances.get(ind))                                   // and the midpoint of the segment by adding the highpoint and lowpoint and dividing by 2
+                  .add(ee.Number(centrelineSplitDistances.get(ee.Number(ind).add(1)))))
+                  .divide(2))
+      }));
+      
+    var addCentrelineSegmentsAlbedo = function(image) {                                                                 // Creates a function to reduce the mosaic albedo under the splitLines collection...
+      var reduced = image.select('Albedo').reduceRegions({
+        collection: splitLines,
+        reducer: ee.Reducer.mean(),
+        scale: 30,
+      });
+    
+    return reduced.map(function(f) {                                                                                    // setting all the following information as metadata....
+      return f.set({
+        'RGI_ID': glacierId,
+        'YEAR': image.get('YEAR'),
+        'MONTH': image.get('MONTH'),
+        'DATE_START': image.get('DATE_START'),
+        'DISTANCE_MIN': f.get('DISTANCE_MIN'),
+        'DISTANCE_MID': f.get('DISTANCE_MID'),
+        'DISTANCE_MAX': f.get('DISTANCE_MAX'),
+        'MEAN_ALBEDO': f.get('mean')
+      });
+    });
+    };
+    
+    var transectStats = zonalAlbedoMosaics.map(addCentrelineSegmentsAlbedo).flatten();                                  // and then applying this to the original mosaic collection (WITHOUT original mosaic albedo data).
+    
+
+
+
+
+
+
+
+
+
+///////////////////////////////
+/// EXPORT PER-GLACIER DATA ///
+///////////////////////////////
+
+    var shortId = glacierId.slice(-5);
+    
+    Export.table.toDrive({
+      collection: mosaicStats,
+      description: shortId + '_MosaicStats',
+      folder: 'ST3_mosaics',
+      fileFormat: 'CSV'
+    });
+    
+    Export.table.toDrive({
+      collection: transectStats,
+      description: shortId + '_TransectStats',
+      folder: 'ST3_mosaics',
+      fileFormat: 'CSV'
+    });
+  }
+});   // END WHOLE LOOP
