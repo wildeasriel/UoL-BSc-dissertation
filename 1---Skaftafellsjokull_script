@@ -1,0 +1,787 @@
+// Skaftafellsjökull
+
+// This is the initial test script written for Skaftafellsjokull. A summary of the sections is given below. The code can be adapted for any glacier by changing the point geometry, and has been successfully tested for 
+// Kaldalonsjokull, Gigjokull and Dyungjujokull. It has not been tested outside Iceland.
+
+// Section overview:
+// > Import initial data
+// > Cloud masking
+// > Combined Landsat collection
+// > NDSI
+// > Albedo
+// > Mean albedo and NDSI metadata
+// > Valid area
+// > By-image metadata export
+// > Mean albedo time series
+// > Aggregate statistics
+// > Rolling albedo mosaics
+// > Mosaic valid pixel area and mean metadata
+// > Mosaic aggregate statistics
+// > Zonal albedo
+// > Export mosaic metadata
+// > Creating centrelines and export to Drive
+
+///////////////////////////
+/// IMPORT INITIAL DATA ///
+///////////////////////////
+
+/// > Load RGI shapefile for Skaftafellsjokull by filtering by point geometry
+
+var rgi = ee.FeatureCollection('projects/ee-jmleaglacio/assets/RGI7pt0/RGI7product')
+  .filterBounds(geometry)//.aside(print, 'Skaftafellsjökull polygon')                                            // Filter by point geometry and print shapefile metadata to console
+    
+var rgiFeat = ee.FeatureCollection(rgi).first()//.aside(print, 'rgiFeat, First RGI polygon')                     // Take the 1st feature from the feature collection and print this to the console
+var rgiGeom = ee.Feature(rgiFeat).geometry()//.aside(print, 'rgiFeat, Geometry of first RGI polygon')            // Extract the geometry of the 1st feature and print this the console
+
+
+Map.addLayer(rgi, null, 'Skaftafellsjökull polygon')                                                             // Add the 1st RGI shapefile to the map and rename. 
+    
+// Export.table.toDrive({
+//   collection: ee.FeatureCollection([rgiFeat]),
+//   description: 'RGI_Skaftafellsjokull',
+//   fileFormat: 'SHP'
+// });
+
+
+
+
+
+
+
+
+
+
+
+/////////////////////////////
+///     CLOUD MASKING     ///
+/////////////////////////////
+
+/// > from Robert McNabb, via Davies et al. (2024)
+/// > Defines a function which works as a bitmask filter using the QA_pixel quality band to filter out pixels affected by clouds and cloud shadows
+
+function cloudMask(image) {
+  var qa = image.select('QA_PIXEL');
+  var cloud = qa
+    .bitwiseAnd(1 << 1)                                                                                          // dilated clouds
+    .or(qa.bitwiseAnd(1 << 2))                                                                                   // cirrus
+    .or(qa.bitwiseAnd(1 << 3))                                                                                   // cloud
+    .or(qa.bitwiseAnd(1 << 4));                                                                                  // cloud shadow
+
+  return image.updateMask(cloud.not())                                                                           //.updateMask(edge);
+}
+
+
+
+
+
+
+
+
+
+
+
+///////////////////////////////////
+/// COMBINED LANDSAT COLLECTION ///
+///////////////////////////////////
+
+/// > Loads Landsat 4-9
+/// > Filters to the bounds of the shapefile
+/// > Remaps relevant bands from Landsats 4-7 to those from Landsats 8-9
+/// > Masks cloudy pixels
+/// > Does NOT filter out whole cloudy images due to persistently high cloud cover above Vatnajökull
+
+var landsat4 = ee.ImageCollection("LANDSAT/LT04/C02/T1_L2").filterBounds(rgiGeom)                               // .filterBounds ensures only loading images within rgi shapefile
+  //.filter(ee.Filter.calendarRange(7,9,'month'))
+  .select(['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7', 'QA_PIXEL'],                                   // Select bands and reassign to those used in Landsat 8-9
+    ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7', 'QA_PIXEL']) 
+  .map(cloudMask)                                                                                               // Map McNabb's cloud mask function over the collection
+
+var landsat5 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2").filterBounds(rgiGeom)
+  //.filter(ee.Filter.calendarRange(7,9,'month'))
+  .select(['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7', 'QA_PIXEL'],
+    ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7', 'QA_PIXEL'])
+  .map(cloudMask)
+
+var landsat7 = ee.ImageCollection("LANDSAT/LE07/C02/T1_L2").filterBounds(rgiGeom)                               // Note shift from TM to ETM
+  //.filter(ee.Filter.calendarRange(7,9,'month'))
+  .select(['SR_B1', 'SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B7', 'QA_PIXEL'],
+    ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7', 'QA_PIXEL'])
+  .map(cloudMask)
+
+var landsat8 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2").filterBounds(rgiGeom)                               // Note shift from ETM to OLI
+  //.filter(ee.Filter.calendarRange(7,9,'month'))
+  .select(['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7', 'QA_PIXEL'])
+  .map(cloudMask)
+  
+var landsat9 = ee.ImageCollection("LANDSAT/LC09/C02/T1_L2").filterBounds(rgiGeom)
+  //.filter(ee.Filter.calendarRange(7,9,'month'))
+  .select(['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7', 'QA_PIXEL'])
+  .map(cloudMask)
+
+var landsat = landsat4
+  .merge(landsat5)
+  .merge(landsat7)
+  .merge(landsat8)
+  .merge(landsat9)
+  .sort('system:time_start');
+  
+//print('Raw Landsat collection:', landsat);                                                                    // Print list of all images to the console
+
+
+
+
+
+
+
+
+
+
+///////////////////////////
+///         NDSI        ///
+///////////////////////////
+
+/// > Calculates NDSI to exclude non-ice areas
+/// > Adds NDSI band to 
+/// > From http://www.usgs.gov/landsat-missions/normalized-difference-snow-index#:~:text=Landsat%20Collection%202%20Normalized%20Difference,the%20shortwave%20infrared%20(SWIR).
+/// > (commented out) Adds first image to layer
+
+var landsatNdsiUnmapped = function(image) {                                                                     // Creates a function which...
+  var ndsi = image.expression(                                                                                  // For each image in a given collection applies the expression...
+    '(green - swir1) / (green + swir1)',                                                                        // Of the NDSI equation...
+    {
+      green: image.select('SR_B3'),                                                                             // For which these are the bands required...
+      swir1: image.select('SR_B6')
+    }
+  ).rename('NDSI');
+    
+  return image.addBands(ndsi)                                                                                   // And this adds NDSI as a band to the image in the collection.
+    .clip(rgi)
+    .updateMask(ndsi.gt(0.38))
+};
+
+var landsatNdsi = landsat.map(landsatNdsiUnmapped);                                                             // Applies the function to each image in the Landsat collection
+
+//print ('Landsat with NDSI:', landsatNdsi);                                                              
+
+
+
+                                
+
+
+
+
+
+
+
+
+
+
+
+///////////////////////////
+///        ALBEDO       ///
+///////////////////////////
+
+/// > Calculates albedo using an eq. presented by Liang (2001), via Davies et al. (2024)
+/// > Adapted to use USGS scale factors
+
+var scaleFactor = 0.0000275;
+var offset = -0.2;
+
+var landsatAlbedoUnmapped = function(image){                                                                    // Creates a function which...
+  
+  var scaledBands = image.select(['SR_B2', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7'])                                 // Rescales the bands in each image in a given collection so albedo can be calculated accurately...
+    .multiply(scaleFactor).add(offset); 
+  
+  var albedo = scaledBands.expression(
+    '(0.356 * blue) + (0.130 * red) + (0.373 * nir) + (0.085 * swir1) + (0.072 * swir2) - 0.0018',              // Calculates Liang's shortwave albedo equation for each image using the rescaled bands...
+    {
+      'blue': scaledBands.select('SR_B2'),                                                                      // Defines these as the bands...
+      'red': scaledBands.select('SR_B4'),
+      'nir': scaledBands.select('SR_B5'),
+      'swir1': scaledBands.select('SR_B6'),
+      'swir2': scaledBands.select('SR_B7')
+    });
+  
+  albedo = albedo.updateMask(albedo.lte(1));                                                                    // Filter out pixels with albedo <0 or >1.
+  
+  return image.addBands(albedo.rename('Albedo')).clip(rgi);                                                     // Adds albedo as an image band.
+};
+
+var landsatAlbedo = landsatNdsi.map(landsatAlbedoUnmapped);                                                     // Applies the function to the landsatNdsi collection
+
+print ('Albedo collection with NDSI and albedo:', landsatAlbedo)
+
+
+
+
+
+
+
+
+
+
+/////////////////////////////////////////
+///   MEAN ALBEDO AND NDSI METADATA   ///
+/////////////////////////////////////////
+
+/// > Creates functions which reduce NDSI and albedo to mean values for each image 
+/// > Adds these properties as image property metadata
+/// > Structure adapted from JL's code for 'landsatArea' in below section and from
+///   https://developers.google.com/earth-engine/apidocs/ee-image-reduceregion. 
+
+
+      // Mean albedo
+    
+    
+var addMeanAlbedoMetadata = function(image) {                                                                   // Creates a function which...
+  
+  var meanAlbedoDict = image.select('Albedo').reduceRegion({                                                    // For an image in a given collection selects the band 'albedo' and reduces to...
+    reducer: ee.Reducer.mean(),                                                                                 // the mean value...
+    geometry: rgiGeom,                                                                                          // for the RGI geometry...
+    scale: 30,                                                                                                  // at this scale...
+    maxPixels: 1e13                                                                                             // and utilising the absolute maximum number of pixels GEE will allow
+  });
+  
+  var meanAlbedo = ee.Number(meanAlbedoDict.get('Albedo'));                                                     // Extracts the mean albedo value from the meanAlbedoDict image collection...
+  
+  return image.set('MEAN_ALBEDO', meanAlbedo)                                                                   // and sets this as an image property.
+};
+
+var landsatAlbedoMeanAlbedoMetadata = landsatAlbedo.map(addMeanAlbedoMetadata)                                  // Creates a new image collection using the landsatAlbedo collection (reminder: this already has albedo and NDSI bands) and applies the mean albedo function to it
+
+
+      // Mean NDSI 
+    
+    
+var addMeanNDSIMetadata = function(image) {                                                                     // Functions identically as the mean albedo function except for NDSI
+  
+  var meanNDSIDict = image.select('NDSI').reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: rgiGeom,
+    scale: 30,
+    maxPixels: 1e13
+  });
+  
+  var meanNdsi = ee.Number(meanNDSIDict.get('NDSI'));
+  
+  return image.set('MEAN_NDSI', meanNdsi)
+};
+
+var landsatAlbedoMeanMetadataNoValidArea = landsatAlbedoMeanAlbedoMetadata.map(addMeanNDSIMetadata)             // Adds NDSI to the mean albedo collection. Retroactively renamed to 'Landsat Albedo Mean Metadata No Valid Area' to reflect that valid area % is subsequently added to this collection.
+
+
+
+    // > Optional: Add test image from July 2022 as map layer
+
+var landsatAlbedoMeanMetadataNoValidArea2022 = landsatAlbedoMeanMetadataNoValidArea
+  .filterDate('2022-07-01', '2022-10-31');
+  
+Map.addLayer(landsatAlbedoMeanMetadataNoValidArea2022.first(), null, 'Albedo July 2022 unmasked')
+
+
+
+
+
+
+
+
+
+///////////////////////////
+///     VALID AREA      ///
+///////////////////////////
+
+/// > Calculate valid percentage area
+/// > Adapted from James Lea
+/// > Probably best to get mosaic pixel cover last and add as an additional piece of metadata
+
+var rgiPolygonArea = ee.Number(ee.Feature(rgiFeat).area(0.1).divide(1e6)).aside(print, 'Feature area (km^2)')   // Extracts the area of the polygon in m^2 and divides by 1e6 to convert from m^2 to km^2, prints to the console as an aside
+
+var landsatValidPixelMask = function(image) {                                                                   // Creates a valid pixel mask function which, for images in a given collection...
+  var landsatImageBinary = ee.Image(image).select(['SR_B4']).gte(0)                                             // Creates a binary mask over an image by selecting only pixels where an arbitrary band (in this case, red) has values above 0 (ie., valid values)...
+  
+  var landsatImagePixelArea = ee.Image(landsatImageBinary).multiply(ee.Image.pixelArea())                       // Then finds the area in m^2 of the valid pixels...
+    
+  
+  var landsatArea = ee.Number(                                                                                  // Creates a dictionary of key/value pairs where...
+    ee.Dictionary(
+      ee.Image(landsatImagePixelArea).reduceRegion({                                                            // The total pixel area is taken and reduced to...
+        
+        reducer: ee.Reducer.sum(),                                                                              
+        scale: 30,
+        maxPixels: 1e13,
+        geometry: ee.Geometry(rgiGeom)                                                                          // the sum of the pixel area...
+      })
+    ).get('SR_B4')                                                                                              
+  )
+  
+  var landsatAreaKm2 = landsatArea.divide(1e6)                                                                  // and converts from m^2 to km^2 to stay consistent with polygon area and avoid division errors later in the code
+  
+  var coverPc = ee.Number(landsatAreaKm2).divide(rgiPolygonArea).multiply(100)                                  // also finds valid pixel coverage as a percentage of the glacier shapefile area
+  
+  return image.set({
+    'VALID_PIXEL_AREA': landsatAreaKm2,                                                                         // Adds valid pixel area and percentage as image metadata
+    'VALID_PIXEL_PERCENTAGE': coverPc
+  });
+};
+
+var landsatAlbedoMeanMetadata = landsatAlbedoMeanMetadataNoValidArea.map(landsatValidPixelMask)                 // Completes metadata collection by adding these pieces of metadata 
+
+
+
+
+
+
+
+
+
+
+
+
+/////////////////////////////////////////
+///     BY-IMAGE METADATA EXPORT      ///
+/////////////////////////////////////////
+
+/// > Exports the landsatAlbedoMeanMetadata file to Drive now all the metadata is in place.
+/// > For subsequent analysis in Python/Excel
+
+Export.table.toDrive({
+  collection: landsatAlbedoMeanMetadata,
+  description: "Skaftafellsjokull_complete_byimage_albedo_metadata",
+  fileFormat: "csv",
+  selectors: ["system:index", "DATE_ACQUIRED", "SPACECRAFT_ID", 'CLOUD_COVER_LAND', "MEAN_NDSI", "MEAN_ALBEDO", "VALID_PIXEL_AREA", "VALID_PIXEL_PERCENTAGE"]
+})
+
+
+
+
+
+
+
+
+
+
+
+//////////////////////////////////////////
+///      MEAN ALBEDO TIME SERIES       ///
+//////////////////////////////////////////
+
+/// > Time series of *by image* mean albedo
+/// > Mosaicked time series comes later for greater spatial completenesss
+/// > Aggregate stats of albedo and coverage per image
+/// > Prints graphs to console (this is optional; ideally done via the csv file in Python)
+
+var albedoTimeSeries = landsatAlbedoMeanMetadata.map(function(image) {                                          // Time series function, which for an image in a given collection...
+  return ee.Feature(null, {                                                                                     // Returns a pair of values for...
+    'system:time_start': image.date().millis(),                                                                 // the image date...
+    'MEAN_ALBEDO': image.get('MEAN_ALBEDO')                                                                     // and mean albedo.
+  });
+});
+
+      // Plot of the albedo time series
+      
+var albedoTimeSeriesChart = (                                                                                   // Creates a simple chart
+  ui.Chart.feature.byFeature({                                                                                  
+    features: albedoTimeSeries,                                                                                 // Using the time series dataset
+    xProperty: 'system:time_start',                                                                             // Plotting time on the x axis
+    yProperties: ['MEAN_ALBEDO']                                                                                // and albedo on the y axis
+  })
+)
+.setChartType('LineChart')                                                                                      // Some stylistic properties for the chart. Sets the type as a line chart
+.setOptions({                                                                                                   // and sets some aesthetic attributes of the chart.
+  title: 'Mean albedo time series', 
+  hAxis: {title: 'Date'},
+  vAxis: {title: 'Mean Albedo', minValue: 0, maxValue: 1},
+  pointSize: 4,
+  lineWidth: 2
+});
+
+print(albedoTimeSeriesChart);                                                                                   // Prints the chart to the console
+
+
+
+
+
+
+
+
+
+
+////////////////////////////
+/// AGGREGATE STATISTICS ///
+////////////////////////////
+      
+var albedoStats = landsatAlbedoMeanMetadata.aggregate_stats('MEAN_ALBEDO');                                     // Uses the aggregate stats function to extract aggregate mean albedo stats 
+
+print('Albedo summary statistics:', albedoStats)
+
+
+var coverStats = landsatAlbedoMeanMetadata.aggregate_stats('VALID_PIXEL_PERCENTAGE');                           // Extracts aggregate stats for valid pixel %
+
+print('Coverage summary statistics:', coverStats)
+
+      // Plot of valid pixel percentage against albedo
+
+var scatter = ui.Chart.feature.byFeature({                                                                      // Plots valid pixel percentage against mean albedo using a scatter chart and prints the scatter chart to console.
+  features: landsatAlbedoMeanMetadata,
+  xProperty: 'VALID_PIXEL_PERCENTAGE',
+  yProperties: ['MEAN_ALBEDO']
+})
+.setChartType('ScatterChart')
+.setOptions({
+  title: 'Albedo vs. Valid Pixel Percentage',
+  hAxis: {title: 'Valid Pixel %'},
+  vAxis: {title: 'Mean Albedo'},
+  pointSize: 4
+});
+
+print(scatter);                                                                                                 //
+
+
+
+
+
+
+
+
+
+
+//////////////////////////////
+///  ROLLING ALBEDO MOSAIC ///
+//////////////////////////////
+
+/// > Uses a rolling 30 day window method to produce albedo mosaics from 1984-2024 from valid images
+/// > Further extracts a list of non-empty mosaics (ie., mosaics from months with >0 images)
+/// > (Optionally) exports this data as a .csv file to Drive
+/// > Adapted from Amirhossein Ahrari: https://www.youtube.com/watch?v=ygAu-fEFWjY
+
+var startYear = 1984;                                                                                           // Set start and end years for rolling mosaics                       
+var endYear   = 2024;
+
+var years = ee.List.sequence(startYear, endYear);                                                               // Create a list of years from 1984 to 2024
+var months = ee.List.sequence(1, 12);                                                                           // Create a list of numbers from 1-12 and call these months
+
+var monthlyMosaicsWithEmptyMosaics = ee.ImageCollection.fromImages(                                             // Creates an empty image collection...
+  years.map(function(y) {                                                                                       // which for each year 'y' in years 84-24...
+    return months.map(function(m) {                                                                             // returns months 1-12, and as a function of months 'm'...
+    
+      var start = ee.Date.fromYMD(y, m, 1);                                                                     // defines each month window, e.g. if y = 1998 and m = 06, start = 1998-06-01, then...
+      var end   = start.advance(1, 'month');                                                                    // defines the end of a month as being yyyy-mm+1-01 (e.g. 1998-07-01).
+
+      var mosaic = landsatAlbedoMeanMetadata                                                                    // Produces a mosaic using the full Landsat albedo collection...
+        .filterDate(start, end)                                                                                 // using images filtered to a given month in a given year...
+        .sort('MEAN_ALBEDO', true)                                                                              // and sorted to ensure the images with lowest mean albedo are prioritised...                    
+        .select(['Albedo', 'SR_B4'])                                                                            // select and extract the albedo and red (SR_B4) bands...
+        .mosaic()                                                                                               // produce a mosaic from this information...
+        .clip(rgiGeom);                                                                                         // and clip to the Skaftafellsjökull polygon geometry.
+
+      return mosaic.set({                                                                                       // Return the mosaic and set
+        'YEAR': y,                                                                                              // the year, 
+        'MONTH': m,                                                                                             // month
+        'system:time_start': start.millis()                                                                     // and system time start as metadata.
+      });
+    });
+  }).flatten()  
+);
+                                 
+print ('All mosaics (including empty mosaics):', monthlyMosaicsWithEmptyMosaics)
+
+      // Remove empty mosaics (e.g. mosaics generated in months with 0 images available)
+      
+var mosaicsBandCount = monthlyMosaicsWithEmptyMosaics.map(function(img) {                                       // Count the number of bands available in each mosaic (empty mosaics should have 0 bands)
+  return img.set('band_count', img.bandNames().size());
+});
+
+var monthlyMosaicsAllValidAreas = mosaicsBandCount.filter(ee.Filter.gt('band_count', 0));                       // And create the final set of mosaics by filtering out mosaics with 0 bands (ie., empty mosaics)
+
+print ('Non-empty mosaics:', monthlyMosaicsAllValidAreas)                                                       // and print this list to the console.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+//////////////////////////////////////////////////
+///  MOSAIC VALID PIXEL AREA AND MEAN METADATA ///
+//////////////////////////////////////////////////
+
+/// > Using code from above
+
+var monthlyMosaicsValidArea = monthlyMosaicsAllValidAreas.map(landsatValidPixelMask)                            // For the list of mosaics, map over the valid pixel mask/valid area/percentage 
+                                                                                                                // function to append this info as metadata
+                                                                                                                
+var monthlyMosaicsValidAreaMeanAlbedo = monthlyMosaicsValidArea.map(addMeanAlbedoMetadata)                      // Find the mean albedo for the monthly mosaic, and add this as an image property
+
+var monthlyMosaics = monthlyMosaicsValidAreaMeanAlbedo.filter(ee.Filter.gte('VALID_PIXEL_PERCENTAGE', 80))
+    .aside(print, 'Monthly mosaics with >=80% valid pixels')
+
+    // > Add test mosaic from 2022 to map
+
+var monthlyMosaicsFiltered = monthlyMosaics
+  .filterDate('2022-07-01', '2022-10-31');
+  
+Map.addLayer(monthlyMosaicsFiltered.first(), {min: 0, max: 1}, 'First Monthly Mosaic');
+
+//print('Monthly mosaics valid area metadata test:', monthlyMosaicsFiltered.first())
+
+
+
+
+
+
+
+
+
+///////////////////////////////////
+///  MOSAIC AGGREGATE STATISICS ///
+///////////////////////////////////
+
+var albedoMosaicStats = monthlyMosaics.aggregate_stats('MEAN_ALBEDO');                                     // Uses the aggregate stats function to extract aggregate mean albedo stats 
+
+print('Albedo summary statistics:', albedoMosaicStats)
+
+
+var coverMosaicStats = monthlyMosaics.aggregate_stats('VALID_PIXEL_PERCENTAGE');                           // Extracts aggregate stats for valid pixel %
+
+print('Coverage summary statistics:', coverMosaicStats)
+
+
+
+
+
+
+
+
+
+
+
+////////////////////////
+///   ZONAL ALBEDO   ///
+////////////////////////
+
+/// > Adds MERIT DEM and finds 42nd percentile (general albation/accumulation area elevation boundary)
+/// > Masks areas <58th percentile to find accumulation area albedo
+/// > Masks areas >42nd percentile to find ablation area albedo
+
+var dem = ee.Image("MERIT/DEM/v1_0_3").select('dem').clip(rgiGeom).aside(print, 'DEM metadata:')          // Load DEM and clip to geometry
+
+Map.addLayer(ee.Terrain.hillshade(dem), null, 'MERIT DEM')                                                // Add as a map layer using a simple hillshade
+
+var aar58 = ee.Number(                                                                                    // Finds the 58th elevation percentile                                                                              
+  dem.reduceRegion({                                                                                      // by reducing the DEM
+    reducer: ee.Reducer.percentile([58]),                                                                 // using the ee.Reducer.percentile function
+    geometry: rgiGeom,
+    scale: 30,
+    maxPixels: 1e13
+  }).get('dem')
+);
+
+var ablationMask = dem.lt(aar58)
+var accumulationMask = dem.gte(aar58)
+
+Map.addLayer(ablationMask,{color:'red'}, 'Ablation zone mask')                                            // Produces a mask for the albation zone by masking the accumulation zone
+Map.addLayer(accumulationMask,{color: 'blue'}, 'Accumulation zone mask')                                  // Produces a mask for the accumulation zone by masking the ablation zone
+
+var zonalAlbedoMosaicsUnmapped = function(image) {                                                        // Calculates separate albedo values for the accumulation and albedo zones...
+                                                                                
+  var ablationAlbedo = image.select('Albedo').updateMask(ablationMask)                                    // by taking an image, masking the accumulation or ablation zone...
+    .reduceRegion({
+      reducer: ee.Reducer.mean(),                                                                         // and calculating mean albedo for the relevant zone.
+      geometry: rgiGeom,
+      scale: 30,
+      maxPixels: 1e13
+    });
+    
+  var ablation = ee.Number(ablationAlbedo.get('Albedo'));
+  
+  var accumulationAlbedo = image.select('Albedo').updateMask(accumulationMask)
+    .reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: rgiGeom,
+      scale: 30,
+      maxPixels: 1e13
+    });
+    
+  var accumulation = ee.Number(accumulationAlbedo.get('Albedo'));
+  
+  return image.set({                                                                                        // Sets ablation and accumulation zone metadata
+  
+    'MEAN_ALBEDO_ABLATION': ablation,
+    'MEAN_ALBEDO_ACCUMULATION': accumulation
+  });
+};
+
+var zonalAlbedoMosaics = monthlyMosaics.map(zonalAlbedoMosaicsUnmapped)                                     // and maps over the mosaic collection.
+
+print('58th percentile elevation:', aar58);
+
+//Map.addLayer(ablationMask.updateMask(ablationMask), {palette:['red']}, 'Ablation zone');
+//Map.addLayer(accumulationMask.updateMask(accumulationMask), {palette:['blue']}, 'Accumulation zone');
+
+
+var albedoChart = ui.Chart.feature.byFeature({
+    features: zonalAlbedoMosaics,
+    xProperty: 'system:time_start',
+    yProperties: ['MEAN_ALBEDO', 'MEAN_ALBEDO_ABLATION', 'MEAN_ALBEDO_ACCUMULATION']
+  })
+  .setChartType('LineChart')
+  .setOptions({
+    title: 'Glacier Albedo: Overall, Ablation, Accumulation',
+    hAxis: {title: 'Date'},
+    vAxis: {title: 'Mean Albedo', minValue: 0, maxValue: 1},
+    lineWidth: 2,
+    pointSize: 3,
+    series: {
+      0: {color: 'black'},  // Overall
+      1: {color: 'red'},    // Ablation
+      2: {color: 'blue'}    // Accumulation
+    }
+  });
+
+print(albedoChart);
+
+/////////////////////////////////
+///   EXPORT MOSAIC METADATA  ///
+/////////////////////////////////
+      
+
+Export.table.toDrive({
+  collection: monthlyMosaicsValidAreaMeanAlbedo,
+  description: "Skaftafellsjokull_mosaic_metadata",
+  fileFormat: "csv",
+  selectors: ["MONTH", "YEAR", "VALID_PIXEL_AREA", "VALID_PIXEL_PERCENTAGE", "MEAN_ALBEDO", "MEAN_ALBEDO_ABLATION", "MEAN_ALBEDO_ACCUMULATION"]
+});
+
+        // Plot
+        
+var mosaicAlbedoTimeSeriesChart = (                                                                             // Creates a simple chart
+  ui.Chart.feature.byFeature({                                                                                  
+    features: monthlyMosaicsValidAreaMeanAlbedo,                                                                // Using the time series dataset
+    xProperty: 'system:time_start',                                                                             // Plotting time on the x axis
+    yProperties: ['MEAN_ALBEDO']                                                                                // and albedo on the y axis
+  })
+)
+.setChartType('LineChart')                                                                                      // Some stylistic properties for the chart. Sets the type as a line chart
+.setOptions({                                                                                                   // and sets some aesthetic attributes of the chart.
+  title: 'Mosaic mean albedo time series', 
+  hAxis: {title: 'Date'},
+  vAxis: {title: 'Mean Albedo', minValue: 0, maxValue: 1},
+  pointSize: 4,
+  lineWidth: 2
+});
+
+print(mosaicAlbedoTimeSeriesChart);     
+
+
+
+
+
+
+
+
+
+
+//////////////////////////////////
+///    CREATING CENTRELINES    ///
+//////////////////////////////////
+
+/// > Extract main glacier centreline and split into segments of 500m
+/// > Reduce albedo under the centreline to produce a transect
+/// > Guide used: https://code.earthengine.google.com/3683f4606ed26586d7c697d6562cb0d2
+
+var rgiId = ee.Feature(rgi.first().get('rgi_id'));
+
+var centreline = ee.Feature(ee.FeatureCollection('projects/ee-jmleaglacio/assets/RGI7pt0/RGI7centerlines')                // Extract the glacier's longest centreline 
+   .filter(ee.Filter.eq('rgi_g_id',rgiId))
+   .sort('length_m',false)
+   .first());
+
+var centrelineLength = ee.Number(ee.Feature(centreline).get('length_m'))                                                  // Extract the length of the centreline which is stored as metadata
+
+var centrelineSplitDistances = ee.List.sequence(0,centrelineLength,500)                                                   // Produce a sequence of numbers increasing by 500m, starting from 0 and ending at the glacier's length
+
+var centrelineCoordsList = ee.List(ee.Feature(centreline)                                                                 // Split the centreline into segments by the units in the above variable, and extract the geometry and coordinates
+          .cutLines(centrelineSplitDistances).geometry().coordinates())
+
+var centrelineCoordsListIndex = ee.List.sequence(0, ee.Number(ee.List(centrelineCoordsList).size()).subtract(1))          // Produce a list of indices corresponding to each segment of the centreline
+
+var splitLines=ee.FeatureCollection(ee.List(centrelineCoordsListIndex)                                                    // Map over the list of indices 
+                .map(function(ind){
+                 var line=ee.Geometry.LineString(ee.List(centrelineCoordsList).get(ind))                                  // Create a distinct line geometry for a given pair of segment coordinates
+                 return ee.Feature(line)                                                                                  // Forms the line into an ee.Feature so attributes can be attached, including...
+                         .set('rgi_id',rgiId,                                                                             // the RGI ID...
+                               'DISTANCE_MIN',centrelineSplitDistances.get(ind),                                          // the highest position of the segment (e.g. if ind=5, distance=2500)
+                               'DISTANCE_MAX',centrelineSplitDistances.get(ee.Number(ind).add(1)),                        // the lowest position of the segment...
+                               'DISTANCE_MID',ee.Number(ee.Number(centrelineSplitDistances.get(ind))                      // and the midpoint of the segment
+                                               .add(ee.Number(centrelineSplitDistances.get(ee.Number(ind).add(1)))))
+                                               .divide(2))
+               }))
+                
+Map.addLayer(splitLines,{color:'red'}, 'Skaftafellsjökull centreline')
+                
+                
+                
+var centrelineSegmentsAlbedoFunction = function(image) {                                                                  // Create a function to reduce the mosaic albedo under the splitLines collection...
+  var reduced = image.select('Albedo').reduceRegions({
+     collection: splitLines,
+     reducer: ee.Reducer.mean(),
+     scale: 30,
+  });
+  
+   return reduced.map(function(f) {                                                                                       // setting all the following information as metadata...
+     return f.set({
+      'RGI_ID': f.get('rgi_id'),
+      'YEAR': image.get('YEAR'),
+      'MONTH': image.get('MONTH'),
+      'TIME_START': image.get('system:time_start'),
+    });
+  });
+};
+
+var segmentedMosaicMeanAlbedo = monthlyMosaicsValidAreaMeanAlbedo.map(centrelineSegmentsAlbedoFunction).flatten();        // and then apply this to the collection.
+
+print ('Mean albedo from mosaic per glacier centreline segment (first 10):', segmentedMosaicMeanAlbedo.limit(10));
+
+
+
+    // > Export data to Drive
+    
+Export.table.toDrive({
+  collection: segmentedMosaicMeanAlbedo,
+  description: "Skaftafellsjokull_mosaic_albedo_segments",
+  fileFormat: "CSV",
+  selectors: ['TIME_START','DISTANCE_MIN','DISATANCE_MID','DISTANCE_MAX','YEAR','MONTH','MEAN']
+ });
+
+
+
+    // > Print sample transect to console
+    
+    
+var segmentedMosaicMeanAlbedoJul22 = segmentedMosaicMeanAlbedo
+  .filter(ee.Filter.eq('YEAR', 2022)).filter(ee.Filter.eq('MONTH', 7)).aside(print, 'Segmented Jul 22 mosaic mean albedo:')
+
+var transectJul22 = (                                                                            
+  ui.Chart.feature.byFeature({                                                                                  
+    features: segmentedMosaicMeanAlbedoJul22,                                                              
+    xProperty: 'DISTANCE_MID',                                                                             
+    yProperties: ['mean']                                                                                
+  })
+)
+.setChartType('LineChart')                                                                                      
+.setOptions({                                                                                                   
+  title: 'Albedo transect of the July 2022 mosaic for the Skaftafellsjökull glacier, Iceland', 
+  hAxis: {title: 'Distance along transect (m)'},
+  vAxis: {title: 'Mean Albedo', minValue: 0, maxValue: 1},
+  pointSize: 4,
+  lineWidth: 2
+});
+
+print(transectJul22);     
